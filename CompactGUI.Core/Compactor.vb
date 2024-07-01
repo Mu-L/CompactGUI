@@ -2,7 +2,7 @@
 Imports System.Runtime.InteropServices
 Imports System.Threading
 
-Public Class Compactor
+Public Class Compactor : Implements IDisposable
 
     Public Sub New(folder As String, cLevel As CompressionAlgorithm, excludedFilesTypes As String())
 
@@ -27,29 +27,32 @@ Public Class Compactor
 
     Private _pauseSemaphore As New SemaphoreSlim(1, 2)
 
-
     Private _processedFileCount As New Concurrent.ConcurrentDictionary(Of String, Integer)
 
     Private _cancellationTokenSource As New CancellationTokenSource
 
     Public Async Function RunCompactAsync(Optional progressMonitor As IProgress(Of (percentageProgress As Integer, currentFile As String)) = Nothing) As Task(Of Boolean)
+        If _cancellationTokenSource.IsCancellationRequested Then Return False
 
         Dim FilesList = Await BuildWorkingFilesList()
         Dim totalFiles As Integer = FilesList.Count
 
         _processedFileCount.Clear()
 
+
         Await Parallel.ForEachAsync(FilesList,
                                 Function(file, _ctx) As ValueTask
+                                    If _ctx.IsCancellationRequested Then Return ValueTask.FromCanceled(_ctx)
                                     Return New ValueTask(PauseAndProcessFile(file, _cancellationTokenSource.Token, totalFiles, progressMonitor))
                                 End Function).ConfigureAwait(False)
+
 
         If _cancellationTokenSource.IsCancellationRequested Then Return False
 
         Return True
     End Function
 
-    Private Async Function PauseAndProcessFile(file As String, _ctx As CancellationToken, totalFiles As Integer, progressMonitor As IProgress(Of (percentageProgress As Integer, currentFile As String))) As Task
+    Private Async Function PauseAndProcessFile(file As String, _ctx As CancellationToken, totalFiles As Integer, Optional progressMonitor As IProgress(Of (percentageProgress As Integer, currentFile As String)) = Nothing) As Task
 
         If _ctx.IsCancellationRequested Then Return
         Try
@@ -65,12 +68,15 @@ Public Class Compactor
         Dim res = WOFCompressFile(file)
         _processedFileCount.TryAdd(file, 1)
         Dim incremented = _processedFileCount.Count
-        progressMonitor.Report((CInt(((incremented / totalFiles) * 100)), file))
+
+        progressMonitor?.Report((CInt(((incremented / totalFiles) * 100)), file))
+
     End Function
 
     Public Sub PauseCompression()
         _pauseSemaphore.Wait()
     End Sub
+
 
     Public Sub ResumeCompression()
         If _pauseSemaphore.CurrentCount = 0 Then _pauseSemaphore.Release()
@@ -107,7 +113,7 @@ Public Class Compactor
         Dim ret = Await ax.AnalyseFolder(Nothing)
 
         Parallel.ForEach(ax.FileCompressionDetailsList, Sub(fl)
-                                                            Dim ft = New FileInfo(fl.FileName)
+                                                            Dim ft = fl.FileInfo
                                                             If Not _excludedFileTypes.Contains(ft.Extension) AndAlso ft.Length > clusterSize AndAlso fl.CompressionMode <> _WOFCompressionLevel Then _filesList.Add(fl.FileName)
                                                         End Sub)
 
@@ -116,5 +122,12 @@ Public Class Compactor
     End Function
 
 
-
+    Public Sub Dispose() Implements IDisposable.Dispose
+        _cancellationTokenSource.Dispose()
+        _pauseSemaphore.Dispose()
+        If _EFInfoPtr <> IntPtr.Zero Then
+            Marshal.FreeHGlobal(_EFInfoPtr)
+            _EFInfoPtr = IntPtr.Zero
+        End If
+    End Sub
 End Class
